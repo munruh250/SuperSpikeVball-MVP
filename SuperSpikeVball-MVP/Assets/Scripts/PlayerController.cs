@@ -1,4 +1,3 @@
-using System;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -8,180 +7,200 @@ public class PlayerController : MonoBehaviour
     [Header("Movement Settings")]
     public float moveSpeed = 5f;
     public float jumpForce = 7f;
+    public float rotationSpeed = 10f;
 
-    [Header("Serve Settings")]
+    [Header("Serve Zones")]
+    public float zone1MinX = -13f, zone1MaxX = -8.5f, zone1MinZ = -4f, zone1MaxZ = 4f;
+    public float zone2MinX = 8.5f, zone2MaxX = 13f, zone2MinZ = -4f, zone2MaxZ = 4f;
+
+    [Header("Ball Hold Offset")]
+    [Tooltip("Local offset where the ball sits when held")]
+    public Vector3 holdOffset = new Vector3(-0.28f, 0.92f, 0.18f);
+
+    [Header("Ideal Hit Offset & Forgiveness")]
+    [Tooltip("Where the ball should be for a perfect hit, relative to player root.")]
+    public Vector3 idealHitOffset = new Vector3(0.5f, 1.2f, 0f);
+    [Tooltip("Max distance from ideal hit for full accuracy.")]
+    public float hitRadius = 2f;
+
+    [Header("Serve Toss Settings")]
     public BallController ballController;
-    public float minTossSpeed = 4f;
-    public float maxTossSpeed = 10f;
-    public float maxChargeTime = 2f;
-    public float serveSpeed = 12f;
-    public Vector3 serveDirectionAxis = new Vector3(0, 0, 1);
+    public float minTossSpeed = 4f, maxTossSpeed = 10f, maxChargeTime = 2f;
+    [Tooltip("Direction axis for the toss (plus upward arc)")]
+    public Vector3 tossDirAxis = Vector3.up;
 
-    [Header("Hold Offsets")]
-    public float holdOffsetX = 0.5f;
-    public float holdOffsetY = 1.5f;
-    public float holdOffsetZ = 0.5f;
+    [Header("Spike Settings")]
+    [Tooltip("Base speed given to the ball on a spike")]
+    public float spikeBaseSpeed = 12f;
+    [Tooltip("Upward boost on a spike")]
+    public float spikeUpward = 1f;
 
-    [Header("Arc Settings")]
-    [Range(0f, 1f)] public float maxArcY = 1f;
-    [Range(0f, 1f)] public float minArcY = 0f;
+    [Header("Debug UI")]
+    [Tooltip("Optional UI Text for live accuracy feedback")]
+    public UnityEngine.UI.Text accuracyText;
 
-    // Internal state
-    private Vector2 moveInput;
-    private bool jumpPressed;
-    private bool ballInHand = true;
-    private bool isCharging = false;
-    private bool hasServed = false;
-    private bool movementLocked = false;
-    private float chargeStart = 0f;
-
+    // Cached components
     private Rigidbody rb;
     private Animator animator;
+    private Rigidbody ballRb;
     private Collider ballCollider;
-    private PlayerInputActions inputActions;
+    private PlayerInputActions input;
+
+    // Input & state
+    private Vector2 moveInput;
+    private bool jumpPressed;
+    private float chargeStart;
 
     void Awake()
     {
         rb = GetComponent<Rigidbody>();
         animator = GetComponent<Animator>();
 
-        // Input setup
-        inputActions = new PlayerInputActions();
-        inputActions.Enable();
-        inputActions.Player.Move.performed += ctx => moveInput = ctx.ReadValue<Vector2>();
-        inputActions.Player.Move.canceled  += ctx => moveInput = Vector2.zero;
-        inputActions.Player.Jump.performed  += ctx =>
-        {
-            jumpPressed = true;
-            Debug.Log("[Input] Jump pressed – triggering animation");
-            animator.SetTrigger("Jump");
-        };
-        inputActions.Player.Spike.performed += ctx => OnServePressed();
-        inputActions.Player.Spike.canceled  += ctx => OnServeReleased();
-        inputActions.Player.Bump.performed  += ctx => animator.SetTrigger("Bump");
-        inputActions.Player.Set.performed   += ctx => animator.SetTrigger("Set");
-
-        // Prepare ball for holding
         if (ballController)
         {
-            var ballRb = ballController.GetComponent<Rigidbody>();
+            ballRb = ballController.GetComponent<Rigidbody>();
             ballRb.isKinematic = true;
             ballCollider = ballController.GetComponent<Collider>();
             ballCollider.enabled = false;
-            ballController.OnGroundHit += UnlockMovement;
         }
+
+        // Setup input
+        input = new PlayerInputActions();
+        input.Enable();
+        input.Player.Move.performed += ctx => moveInput = ctx.ReadValue<Vector2>();
+        input.Player.Move.canceled  += ctx => moveInput = Vector2.zero;
+        input.Player.Jump.performed  += ctx => jumpPressed = true;
+        input.Player.Spike.performed += ctx => OnSpikePressed();
+        input.Player.Spike.canceled  += ctx => OnSpikeReleased();
+        input.Player.Bump.performed  += ctx => animator.SetTrigger("Bump");
+        input.Player.Set.performed   += ctx => animator.SetTrigger("Set");
     }
 
     void OnDisable()
     {
-        inputActions.Disable();
-        if (ballController)
-            ballController.OnGroundHit -= UnlockMovement;
+        input.Disable();
     }
 
     void Update()
     {
-        // Snap the held ball to the offset position
-        if (ballInHand && ballController)
+        var state = RallyManager.Instance.State;
+        // Hold ball in hand
+        if ((state == RallyState.PreServe || state == RallyState.TossCharging) && ballController)
         {
-            Vector3 offset = transform.right * holdOffsetX
-                           + transform.up    * holdOffsetY
-                           + transform.forward * holdOffsetZ;
-            ballController.transform.position = transform.position + offset;
+            ballRb.isKinematic = true;
+            ballCollider.enabled = false;
+            ballController.transform.position = transform.position
+                + transform.right * holdOffset.x
+                + transform.up * holdOffset.y
+                + transform.forward * holdOffset.z;
         }
     }
 
     void FixedUpdate()
     {
-        // Apply horizontal movement if not locked
-        if (!movementLocked)
+        var state = RallyManager.Instance.State;
+
+        // Movement
+        Vector3 v = new Vector3(moveInput.x * moveSpeed, rb.velocity.y, moveInput.y * moveSpeed);
+        rb.velocity = v;
+
+        // Clamp pre-serve
+        if (state == RallyState.PreServe)
         {
-            Vector3 v = rb.velocity;
-            v.x = moveInput.x * moveSpeed;
-            v.z = moveInput.y * moveSpeed;
-            rb.velocity = v;
-        }
-        else
-        {
-            // Freeze horizontal while locked
-            rb.velocity = new Vector3(0, rb.velocity.y, 0);
+            int s = RallyManager.Instance.servingTeam;
+            float minX = (s == 1) ? zone1MinX : zone2MinX;
+            float maxX = (s == 1) ? zone1MaxX : zone2MaxX;
+            float minZ = (s == 1) ? zone1MinZ : zone2MinZ;
+            float maxZ = (s == 1) ? zone1MaxZ : zone2MaxZ;
+            Vector3 p = transform.position;
+            p.x = Mathf.Clamp(p.x, minX, maxX);
+            p.z = Mathf.Clamp(p.z, minZ, maxZ);
+            rb.MovePosition(p);
         }
 
-        // Jump physics
+        // Jump
         if (jumpPressed && Mathf.Abs(rb.velocity.y) < 0.05f)
+        {
             rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
+            animator.SetTrigger("Jump");
+        }
         jumpPressed = false;
 
+        // Facing & run anim
+        if (moveInput.sqrMagnitude > 0.01f)
+        {
+            Quaternion tgt = Quaternion.LookRotation(new Vector3(moveInput.x, 0, moveInput.y));
+            transform.rotation = Quaternion.Slerp(transform.rotation, tgt, rotationSpeed * Time.deltaTime);
+        }
         animator.SetFloat("Speed", moveInput.magnitude);
     }
 
-    private void OnServePressed()
+    private void OnSpikePressed()
     {
-        if (!ballController) return;
-
-        if (ballInHand)
+        var state = RallyManager.Instance.State;
+        if (state == RallyState.PreServe)
         {
-            // Begin toss charge: lock movement
-            isCharging = true;
-            movementLocked = true;
+            // Start toss charge
             chargeStart = Time.time;
-            Debug.Log($"Charge start at {chargeStart:F2}s");
             animator.SetBool("IsCharging", true);
+            RallyManager.Instance.BeginTossCharge();
         }
-        else
+        else if (state == RallyState.Tossed)
         {
-            // Always play spike animation
+            // Always play spike
             animator.SetTrigger("Spike");
-            Debug.Log("Spike animation triggered");
+            RallyManager.Instance.SpikeInFlight();
 
-            // Only launch serve once
-            if (!hasServed)
+            // Accuracy based on ideal offset
+            Vector3 idealPos = transform.position
+                + transform.right * idealHitOffset.x
+                + transform.up    * idealHitOffset.y
+                + transform.forward * idealHitOffset.z;
+            float dist = Vector3.Distance(idealPos, ballController.transform.position);
+            float accuracy = 1f - Mathf.Clamp01(dist / hitRadius);
+            Debug.Log($"Hit dist={dist:F2}m → accuracy={accuracy:P0}");
+
+            if (accuracyText != null)
             {
-                hasServed = true;
-                UnlockMovement();
-                ballCollider.enabled = true;
-                var brb = ballController.GetComponent<Rigidbody>();
-                brb.isKinematic = false;
-
-                // Compute arc based on left stick Y
-                float arcInput = Mathf.Clamp01(1f - moveInput.y);
-                float arcY = Mathf.Lerp(minArcY, maxArcY, arcInput);
-                Vector3 dir = new Vector3(serveDirectionAxis.x, arcY, serveDirectionAxis.z);
-
-                Debug.Log($"Serving with arcY={arcY:F2}, dir={dir}, speed={serveSpeed}");
-                ballController.Launch(dir, serveSpeed);
+                accuracyText.text = $"Acc: {accuracy:P0}";
+                accuracyText.color = Color.Lerp(Color.red, Color.green, accuracy);
             }
+
+            // Launch toward opponent
+            int server = RallyManager.Instance.servingTeam;
+            Vector3 forwardDir = (server == 1) ? Vector3.right : Vector3.left;
+            Vector3 spikeDir = (forwardDir + Vector3.up * spikeUpward).normalized;
+            float launchSpeed = spikeBaseSpeed * Mathf.Lerp(0.5f, 1.5f, accuracy);
+            ballController.Launch(spikeDir, launchSpeed, false);
         }
     }
 
-    private void OnServeReleased()
+    private void OnSpikeReleased()
     {
-        if (ballInHand && isCharging)
-        {
-            // Compute toss velocity
-            float held    = Time.time - chargeStart;
-            float t       = Mathf.Clamp01(held / maxChargeTime);
-            float tossVel = Mathf.Lerp(minTossSpeed, maxTossSpeed, t);
-            Debug.Log($"Charge held {held:F2}s → toss speed {tossVel:F2}");
+        var state = RallyManager.Instance.State;
+        if (state != RallyState.TossCharging) return;
 
-            // Toss upward
-            ballCollider.enabled = true;
-            var brb = ballController.GetComponent<Rigidbody>();
-            brb.isKinematic = false;
-            Vector3 offset = transform.right * holdOffsetX
-                           + transform.up    * holdOffsetY
-                           + transform.forward * holdOffsetZ;
-            ballController.transform.position = transform.position + offset;
-            ballController.Launch(Vector3.up, tossVel);
+        float held = Time.time - chargeStart;
+        float t = Mathf.Clamp01(held / maxChargeTime);
+        float speed = Mathf.Lerp(minTossSpeed, maxTossSpeed, t);
+        Vector3 dir = tossDirAxis + Vector3.up * t;
 
-            ballInHand = false;
-            isCharging = false;
-            animator.SetBool("IsCharging", false);
-        }
+        ballRb.isKinematic = false;
+        ballCollider.enabled = true;
+        ballController.Launch(dir, speed, true);
+
+        animator.SetBool("IsCharging", false);
+        RallyManager.Instance.ReleaseToss();
     }
 
-    private void UnlockMovement()
+    void OnDrawGizmosSelected()
     {
-        movementLocked = false;
+        // Draw ideal hit sphere
+        Gizmos.color = Color.cyan;
+        Vector3 idealPos = transform.position
+            + transform.right * idealHitOffset.x
+            + transform.up    * idealHitOffset.y
+            + transform.forward * idealHitOffset.z;
+        Gizmos.DrawWireSphere(idealPos, hitRadius);
     }
 }
